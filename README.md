@@ -1,71 +1,61 @@
 # Bot py
-My First bot
-import MetaTrader5 as mt5
+My First botl
+import requests
 import pandas as pd
 import time
-import logging
 from datetime import datetime
+import logging
+import math
 
-# CONFIGURATIONS
-SYMBOL = "EURUSD"
-FAST_MA = 10  # Fast moving average period
-SLOW_MA = 30  # Slow moving average period
+# =========== CONFIG ===========
+
+# [1] API config (GET YOUR FREE API KEY!)
+API_KEY = "<YOUR_API_KEY_HERE>"  # e.g., https://financialmodelingprep.com/developer/docs/
+SYMBOL = "EURUSD"  # Used by most APIs as 'EURUSD', double-check for your API
+API_URL = f"https://financialmodelingprep.com/api/v3/historical-chart/1min/{SYMBOL}?apikey={API_KEY}"
+
+# [2] Strategy parameters
+FAST_MA = 10
+SLOW_MA = 30
 RSI_PERIOD = 14
 RSI_THRESHOLD = 50
-TIMEFRAME = mt5.TIMEFRAME_M1  # 1 minute
-TRADE_RISK = 0.01  # 1% per trade
 STOP_LOSS_PIPS = 20
 TAKE_PROFIT_PIPS = 40
-MAGIC_NUMBER = 270926  # Unique magic number for all bot trades
+RISK_PER_TRADE = 0.01
 
-# LOGGING SETUP
-logging.basicConfig(
-    filename='trading_log.txt',
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
+# [3] Simulation
+INITIAL_BALANCE = 10000.0  # USD
+MIN_LOT = 0.01
 
-def log_trade(message):
-    print(message)
-    logging.info(message)
+# [4] Log file
+logging.basicConfig(filename="sim_trading_log.txt", level=logging.INFO, 
+                    format='%(asctime)s %(levelname)s %(message)s')
 
-def initialize_mt5():
-    if not mt5.initialize():
-        print("MT5 initialize() failed")
-        logging.error("MT5 initialize() failed")
-        quit()
-    print("MT5 initialized.")
+# =========== STATE ===========
 
-def shutdown_mt5():
-    mt5.shutdown()
-    print("MT5 connection closed.")
+class Position:
+    def __init__(self, direction, open_price, lot, sl, tp, open_time):
+        self.direction = direction  # "buy" or "sell"
+        self.open_price = open_price
+        self.lot = lot
+        self.sl = sl
+        self.tp = tp
+        self.open_time = open_time
+        self.close_price = None
+        self.close_time = None
+        self.profit = 0
 
-def get_account_info():
-    acc_info = mt5.account_info()
-    if acc_info is None:
-        raise Exception("Could not get account info")
-    balance = acc_info.balance
-    equity = acc_info.equity
-    return balance, equity
+# Single open position (None if no trade open)
+open_position = None
+balance = INITIAL_BALANCE
+trade_history = []
 
-def get_data(symbol, timeframe, n):
-    """Fetch historical rates as Pandas DataFrame"""
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, n)
-    if rates is None or len(rates) < n:
-        raise Exception("Not enough data to calculate indicators")
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    return df
+# =========== INDICATORS ===========
 
-def calculate_indicators(df):
-    """Adds fast and slow moving averages and RSI to DataFrame"""
-    df['fast_ma'] = df['close'].rolling(window=FAST_MA).mean()
-    df['slow_ma'] = df['close'].rolling(window=SLOW_MA).mean()
-    df['rsi'] = ta_rsi(df['close'], RSI_PERIOD)
-    return df
+def calc_sma(series, period):
+    return series.rolling(window=period).mean()
 
-def ta_rsi(series, period):
-    """Compute RSI as pandas Series"""
+def calc_rsi(series, period):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -73,132 +63,151 @@ def ta_rsi(series, period):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def lot_size(balance, price, stop_loss_pips):
-    """Calculate position size to risk specified percent"""
-    risk_amount = balance * TRADE_RISK
-    ticks_per_pip = 10 if "JPY" in SYMBOL else 100000
-    lot = risk_amount / (stop_loss_pips * (price / ticks_per_pip))
-    lot = max(round(lot, 2), 0.01)  # Minimum 0.01 lot
-    return lot
+# =========== UTILS ===========
 
-def get_positions():
-    """Get all bot's open positions for EURUSD"""
-    positions = mt5.positions_get(symbol=SYMBOL)
-    # Filter by magic number to avoid duplicate bot trades
-    return [p for p in positions if p.magic == MAGIC_NUMBER]
-
-def check_crossover(df):
-    """Check if the latest bar had an MA crossover"""
-    if len(df) < SLOW_MA + 2:
+def get_bars(n=50):
+    """Fetches the last n 1-minute bars for EURUSD."""
+    try:
+        resp = requests.get(API_URL)
+        data = resp.json()
+        if not data or isinstance(data, dict) and data.get('Error Message'):
+            raise Exception("API error or quota exceeded")
+        df = pd.DataFrame(data)
+        df = df.sort_values('date')
+        df = df.tail(n)  # last n bars in time order
+        df['close'] = df['close'].astype(float)
+        return df.reset_index(drop=True)
+    except Exception as e:
+        logging.error(f"Failed to download/fetch bar data: {e}")
         return None
-    # Latest and previous values
-    prev_fast = df['fast_ma'].iloc[-2]
-    prev_slow = df['slow_ma'].iloc[-2]
-    curr_fast = df['fast_ma'].iloc[-1]
-    curr_slow = df['slow_ma'].iloc[-1]
 
-    # Golden cross
-    if prev_fast < prev_slow and curr_fast > curr_slow:
-        return 'buy'
-    # Death cross
-    elif prev_fast > prev_slow and curr_fast < curr_slow:
-        return 'sell'
-    return None
+def log_and_print(msg):
+    print(msg)
+    logging.info(msg)
 
-def rsi_trend(df, direction):
-    """Confirm trend by RSI.
-       For buy: RSI > RSI_THRESHOLD, for sell: RSI < RSI_THRESHOLD
-    """
-    rsi = df['rsi'].iloc[-1]
-    if direction == 'buy' and rsi > RSI_THRESHOLD:
-        return True
-    elif direction == 'sell' and rsi < RSI_THRESHOLD:
-        return True
-    return False
+def get_lot_size(balance, price, stoploss_pips):
+    # Example for EURUSD: 1 lot = 100,000 units, pip = 0.0001
+    risk_dollars = balance * RISK_PER_TRADE
+    pip_value_per_lot = 10  # For EURUSD (1 lot is $10/pip)
+    lot = max(risk_dollars / (stoploss_pips * pip_value_per_lot), MIN_LOT)
+    return round(lot, 2)
 
-def open_trade(action, lot, price, sl_pips, tp_pips):
-    """Send an order to open a trade"""
-    deviation = 10
-    # Calculate SL/TP prices
-    point = mt5.symbol_info(SYMBOL).point
-    if action == 'buy':
-        sl = price - sl_pips * point * 10
-        tp = price + tp_pips * point * 10
-        order_type = mt5.ORDER_TYPE_BUY
+def simulate_trade_close(position, current_price, current_time):
+    global balance
+    if position.direction == "buy":
+        # SL hit
+        if current_price <= position.sl:
+            position.close_price = position.sl
+            note = "Stop Loss hit"
+        # TP hit
+        elif current_price >= position.tp:
+            position.close_price = position.tp
+            note = "Take Profit hit"
+        else:
+            return False  # Still open
+    else:  # sell
+        if current_price >= position.sl:
+            position.close_price = position.sl
+            note = "Stop Loss hit"
+        elif current_price <= position.tp:
+            position.close_price = position.tp
+            note = "Take Profit hit"
+        else:
+            return False  
+
+    position.close_time = current_time
+    position.profit = calc_profit(position)
+    trade_history.append(position)
+    balance += position.profit
+    log_and_print(f"Closed {position.direction.upper()} at {position.close_price:.5f} ({note}), Profit=${position.profit:.2f}")
+    logging.info(f"Account balance after close: {balance:.2f}")
+    return True
+
+def calc_profit(position):
+    # Pip value per lot: for EURUSD, 1 lot = $10 per pip, 1 pip = 0.0001
+    pip_value = 10  # Per lot
+    pips = 0
+    if position.direction == "buy":
+        pips = (position.close_price - position.open_price) / 0.0001
     else:
-        sl = price + sl_pips * point * 10
-        tp = price - tp_pips * point * 10
-        order_type = mt5.ORDER_TYPE_SELL
+        pips = (position.open_price - position.close_price) / 0.0001
+    return position.lot * pip_value * pips
 
-    request = {
-        'action': mt5.TRADE_ACTION_DEAL,
-        'symbol': SYMBOL,
-        'volume': lot,
-        'type': order_type,
-        'price': price,
-        'sl': sl,
-        'tp': tp,
-        'deviation': deviation,
-        'magic': MAGIC_NUMBER,
-        'comment': f"MA/RSI {action}",
-        'type_time': mt5.ORDER_TIME_GTC,
-        'type_filling': mt5.ORDER_FILLING_IOC
-    }
+def print_account_status():
+    print(f"Balance: ${balance:.2f} | Open position: {'Yes' if open_position else 'No'}")
+    if open_position:
+        print(f"  {open_position.direction.upper()} | Open@ {open_position.open_price:.5f} | SL: {open_position.sl:.5f} | TP: {open_position.tp:.5f} | Lot: {open_position.lot}")
 
-    result = mt5.order_send(request)
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        log_trade(f"{action.upper()} trade executed: lot={lot}, price={price}, SL={sl}, TP={tp}")
-    else:
-        log_trade(f"Trade failed [{action.upper()}]: retcode {result.retcode} - {result.comment}")
+# =========== MAIN STRATEGY ===========
 
 def main_loop():
-    initialize_mt5()
-    print("=" * 40)
-    print(f"Running Forex Trading Bot for {SYMBOL}")
-    print("=" * 40)
+    global open_position, balance
+    print("Forex Simulated Trading Bot (EURUSD, 1min bars)")
+    log_and_print(f"Starting bal: {balance:.2f}")
+    while True:
+        try:
+            df = get_bars(SLOW_MA+RSI_PERIOD+5)
+            if df is None or len(df) < SLOW_MA+2:
+                print("Waiting for sufficient data...")
+                time.sleep(60)
+                continue
 
-    try:
-        while True:
-            try:
-                balance, equity = get_account_info()
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Account balance: {balance:.2f}, equity: {equity:.2f}")
+            # --- Compute signals
+            df["fast_ma"] = calc_sma(df["close"], FAST_MA)
+            df["slow_ma"] = calc_sma(df["close"], SLOW_MA)
+            df["rsi"] = calc_rsi(df["close"], RSI_PERIOD)
 
-                positions = get_positions()
-                print(f"Open positions: {len(positions)}")
-                for pos in positions:
-                    print(f"  {pos.type} {pos.volume} lots at {pos.price_open} - profit: {pos.profit}")
+            # Prepare for signal extraction
+            prev_fast = df["fast_ma"].iloc[-2]
+            prev_slow = df["slow_ma"].iloc[-2]
+            now_fast = df["fast_ma"].iloc[-1]
+            now_slow = df["slow_ma"].iloc[-1]
 
-                # Get recent data for signal generation
-                bars = SLOW_MA + 10
-                df = get_data(SYMBOL, TIMEFRAME, bars)
-                df = calculate_indicators(df)
+            signal = None
+            # Golden cross (buy, fast crosses up slow)
+            if prev_fast < prev_slow and now_fast > now_slow:
+                signal = "buy"
+            # Death cross (sell, fast crosses down slow)
+            elif prev_fast > prev_slow and now_fast < now_slow:
+                signal = "sell"
 
-                signal = check_crossover(df)
-                if signal and rsi_trend(df, signal):
-                    # Prevent duplicate trades
-                    has_long = any(p.type == mt5.POSITION_TYPE_BUY for p in positions)
-                    has_short = any(p.type == mt5.POSITION_TYPE_SELL for p in positions)
-                    tick = mt5.symbol_info_tick(SYMBOL)
-                    if signal == 'buy' and not has_long:
-                        lot = lot_size(balance, tick.ask, STOP_LOSS_PIPS)
-                        open_trade('buy', lot, tick.ask, STOP_LOSS_PIPS, TAKE_PROFIT_PIPS)
-                    elif signal == 'sell' and not has_short:
-                        lot = lot_size(balance, tick.bid, STOP_LOSS_PIPS)
-                        open_trade('sell', lot, tick.bid, STOP_LOSS_PIPS, TAKE_PROFIT_PIPS)
-                    else:
-                        print("Duplicate or opposite trade prevented.")
+            # RSI filter
+            now_rsi = df["rsi"].iloc[-1]
+            rsi_ok = False
+            if signal == "buy" and now_rsi > RSI_THRESHOLD:
+                rsi_ok = True
+            elif signal == "sell" and now_rsi < RSI_THRESHOLD:
+                rsi_ok = True
+
+            # Current bar info
+            price = float(df["close"].iloc[-1])
+            date_time = df["date"].iloc[-1]
+
+            # ========== TRADE EXECUTION/SIMULATION ==========
+            print_account_status()
+            if open_position:
+                # Check if SL/TP hit
+                closed = simulate_trade_close(open_position, price, date_time)
+                if closed:
+                    open_position = None
+
+            if not open_position and signal and rsi_ok:
+                lot = get_lot_size(balance, price, STOP_LOSS_PIPS)
+                if signal == "buy":
+                    sl = price - STOP_LOSS_PIPS * 0.0001
+                    tp = price + TAKE_PROFIT_PIPS * 0.0001
                 else:
-                    print("No trade signal or RSI trend not confirmed.")
-
-            except Exception as e:
-                log_trade(f"Exception in trading loop: {e}")
-
-            time.sleep(60)  # Run every minute
-
-    except KeyboardInterrupt:
-        print("Stopped by user.")
-    finally:
-        shutdown_mt5()
+                    sl = price + STOP_LOSS_PIPS * 0.0001
+                    tp = price - TAKE_PROFIT_PIPS * 0.0001
+                open_position = Position(signal, price, lot, sl, tp, date_time)
+                log_and_print(f"Opened {signal.upper()} @ {price:.5f} | Lot {lot} | SL {sl:.5f} | TP {tp:.5f}")
+            elif not signal or not rsi_ok:
+                print("No new signal or RSI not in agreement.")
+            
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            print(f"Error: {e}")
+        time.sleep(60)
 
 if __name__ == "__main__":
     main_loop()
